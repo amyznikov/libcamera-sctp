@@ -2,6 +2,7 @@
 .settings
 .cproject
 .project
+build
 
 # Prerequisites
 *.d

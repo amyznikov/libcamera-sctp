@@ -1,6 +1,7 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 3.16)
-
 project(libcamera-sctp CXX)
+
+include(FindPackageHandleStandardArgs)
 
 if( NOT CMAKE_CXX_STANDARD )
 	set (CMAKE_CXX_STANDARD 17)
@@ -13,24 +14,31 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
 set(CMAKE_LINK_WHAT_YOU_USE OFF)
 
+
 # ----------------------------------------------------------------------------
-# libcamera
+# PkgConfig is required to find libcamera
 #
 find_package(PkgConfig QUIET) # REQUIRED
 if ( NOT PkgConfig_FOUND )
-	message( WARNING "PkgConfig NOT FOUND, libcamera can not be detected.")
-else()
-	pkg_check_modules(LIBCAMERA QUIET libcamera)
-	if ( NOT LIBCAMERA_VERSION ) 
-		message(WARNING "libcamera nor found. Install please libcamera package 
-			https://aur.archlinux.org/packages/libcamera-git 
-			https://libcamera.org")
-         return()
-    else()
-		message(STATUS "libcamera: ${LIBCAMERA_VERSION} ${LIBCAMERA_INCLUDE_DIRS} ${LIBCAMERA_LINK_LIBRARIES}")
-		add_definitions(-DHAVE_LIBCAMERA=1)
-    endif()
+	message(FATAL_ERROR "PkgConfig NOT FOUND, libcamera can not be detected.")
+	return()
 endif()
+
+
+# ----------------------------------------------------------------------------
+# libcamera
+#
+pkg_check_modules(LIBCAMERA QUIET libcamera)
+if ( NOT LIBCAMERA_VERSION ) 
+	message(WARNING "libcamera nor found. Install please libcamera package 
+		https://aur.archlinux.org/packages/libcamera-git 
+		https://libcamera.org")
+    return()
+else()
+	message(STATUS "libcamera: ${LIBCAMERA_VERSION} ${LIBCAMERA_INCLUDE_DIRS} ${LIBCAMERA_LINK_LIBRARIES}")
+	add_definitions(-DHAVE_LIBCAMERA=1)
+endif()
+
 
 # ----------------------------------------------------------------------------
 # libconfig
@@ -40,7 +48,8 @@ find_package(libconfig QUIET)
 message(STATUS "libconfig [ ${LIBCONFIG_VERSION}, ${libconfig_VERSION}] found=${libconfig_FOUND}")
 if ( NOT ${libconfig_FOUND} )
     message(FATAL_ERROR "libconfig version >= ${LIBCONFIG_MINIMUM_VERSION_REQUIRED} is not found\n \
-        Please install fresh version of libconfig manually from github: https://github.com/hyperrealm/libconfig.git")
+        Please install fresh libconfig version from repo or manually from github: https://github.com/hyperrealm/libconfig.git")
+	return()
 endif()
 if ( libconfig_VERSION AND NOT LIBCONFIG_VERSION ) # Th case of the lellers vary between ubuntu and arch linux
     set(LIBCONFIG_VERSION ${libconfig_VERSION})
@@ -73,6 +82,24 @@ endif()
 include_directories(${LIBCONFIG_INCLUDE_DIRS})
 message (STATUS "libconfig : ${LIBCONFIG_VERSION} ${LIBCONFIG_INCLUDE_DIRS} ${LIBCONFIG_LIBRARIES}")
 
+
+# ----------------------------------------------------------------------------
+# sctp
+#
+# Look for the header file (usually in /usr/include/netinet/sctp.h) for the library file (libsctp.so)
+find_path(SCTP_INCLUDE_DIR NAMES netinet/sctp.h)
+find_library(SCTP_LIBRARY NAMES sctp)
+find_package_handle_standard_args(SCTP DEFAULT_MSG SCTP_LIBRARY SCTP_INCLUDE_DIR)
+
+if(SCTP_FOUND)
+    set(SCTP_LIBRARIES ${SCTP_LIBRARY})
+    set(SCTP_INCLUDE_DIRS ${SCTP_INCLUDE_DIR})
+	add_definitions(-DHAVE_SCTP=1)
+    message(STATUS "SCTP found: ${SCTP_LIBRARIES} ${SCTP_INCLUDE_DIRS}")
+else()
+    message(STATUS "SCTP NOT found. install sctp package, on archlinux it is lksctp-tools")
+	return()
+endif()
 
 # ----------------------------------------------------------------------------
 # RPI version
@@ -111,8 +138,8 @@ add_executable(${PROJECT_NAME}
 	${HEADER_FILES}
 	${RESOURCE_FILES})
 
-include_directories(${SRC} ${LIBCAMERA_INCLUDE_DIRS} ${LIBCONFIG_INCLUDE_DIRS} ${CORE_INCLUDES})
-target_link_libraries(${PROJECT_NAME} ${LIBCAMERA_LINK_LIBRARIES} ${LIBCONFIG_LIBRARIES} ${CORE_LIBRARIES} -lsctp)
+include_directories(${SRC} ${LIBCAMERA_INCLUDE_DIRS} ${LIBCONFIG_INCLUDE_DIRS} ${SCTP_INCLUDE_DIRS} ${CORE_INCLUDES})
+target_link_libraries(${PROJECT_NAME} ${CORE_LIBRARIES} ${LIBCAMERA_LINK_LIBRARIES} ${LIBCONFIG_LIBRARIES} ${SCTP_LIBRARIES})
 
 
 ## Install app as a service
