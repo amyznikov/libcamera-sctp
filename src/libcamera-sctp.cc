@@ -19,13 +19,36 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <type_traits>
 #include <condition_variable>
 #include <core/io/iface.h>
 #include <core/settings.h>
 #include <core/debug.h>
 
+#if HAVE_OPENCV
+#include <opencv2/opencv.hpp>
+#endif
+
+#if HAVE_TBB
+#include <tbb/tbb.h>
+#endif
+
 
 namespace {
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+template<typename T, typename Func>
+static inline void run_loop(T start, T end, const Func& f)
+{
+#if HAVE_TBB
+    tbb::parallel_for(start, end, f, tbb::static_partitioner());
+#else
+    for (T i = start; i < end; ++i) {
+      f(i);
+    }
+#endif
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 using namespace libcamera;
 using CameraManager = libcamera::CameraManager;
@@ -88,27 +111,32 @@ static std::map<uint32_t, ControlValue> currentUserControls;
  * Special processing is applied to crop the raw ROI manually and send to client app
  * */
 static constexpr PixelFormat specialRawFormats[] = {
+    formats::SBGGR8,
     formats::SBGGR10,
     formats::SBGGR12,
     formats::SBGGR14,
     formats::SBGGR16,
 
+    formats::SRGGB8,
     formats::SRGGB10,
     formats::SRGGB12,
     formats::SRGGB14,
     formats::SRGGB16,
 
+    formats::SGRBG8,
     formats::SGRBG10,
     formats::SGRBG12,
     formats::SGRBG14,
     formats::SGRBG16,
 
+    formats::SGBRG8,
     formats::SGBRG10,
     formats::SGBRG12,
     formats::SGBRG14,
     formats::SGBRG16,
 };
 static Size specialRawSwCropSize;
+static bool enableSecialRawFormatAvgcd = false;
 
 static int isSecialRawFormat(const PixelFormat & fmt)
 {
@@ -120,10 +148,52 @@ static int isSecialRawFormat(const PixelFormat & fmt)
   return -1;
 }
 
+static constexpr int secialRawFormatBPP(const PixelFormat & fmt)
+{
+  switch (fmt) {
+    case formats::SBGGR8:
+    case formats::SRGGB8:
+    case formats::SGRBG8:
+    case formats::SGBRG8:
+      return 8;
+
+    case formats::SBGGR10:
+    case formats::SRGGB10:
+    case formats::SGRBG10:
+    case formats::SGBRG10:
+      return 10;
+
+    case formats::SBGGR12:
+    case formats::SRGGB12:
+    case formats::SGRBG12:
+    case formats::SGBRG12:
+      return 12;
+
+    case formats::SBGGR14:
+    case formats::SRGGB14:
+    case formats::SGRBG14:
+    case formats::SGBRG14:
+      return 14;
+
+    case formats::SBGGR16:
+    case formats::SRGGB16:
+    case formats::SGRBG16:
+    case formats::SGBRG16:
+      return 16;
+
+    default:
+      break;
+  }
+
+  return 0;
+}
+
+
 static const uint8_t * cropSpecialRawFormatImage(const c_libcamera_image & image,
     const PixelFormat & imageFormat,
     const Size & imageSize,
     uint32_t imageStride,
+    uint32_t dataSize,
     const Size & cropSize,
     ImageHeader * outhdr)
 {
@@ -134,8 +204,7 @@ static const uint8_t * cropSpecialRawFormatImage(const c_libcamera_image & image
   const uint32_t cx = ((imageSize.width - cw) / 2) & ~0x1U;
   const uint32_t cy = ((imageSize.height - ch) / 2) & ~0x1U;
 
-  if( imageFormat == formats::SBGGR12 || imageFormat == formats::SRGGB12 || imageFormat == formats::SGRBG12 ||
-      imageFormat == formats::SGBRG12 ) {
+  if( imageFormat == formats::SBGGR12 || imageFormat == formats::SRGGB12 || imageFormat == formats::SGRBG12 || imageFormat == formats::SGBRG12 ) {
 
     const uint32_t src_stride = imageStride;
     const uint32_t dst_stride = cw * 3 / 2;
@@ -169,8 +238,7 @@ static const uint8_t * cropSpecialRawFormatImage(const c_libcamera_image & image
     outhdr->fourcc_modifier = __fourcc_mod(11, 1);
     outhdr->bpp = 12;
   }
-  else if( imageFormat == formats::SBGGR10 || imageFormat == formats::SRGGB10 || imageFormat == formats::SGRBG10 ||
-      imageFormat == formats::SGBRG10 ) {
+  else if( imageFormat == formats::SBGGR10 || imageFormat == formats::SRGGB10 || imageFormat == formats::SGRBG10 || imageFormat == formats::SGBRG10 ) {
 
     const uint32_t src_stride = imageStride;
     const uint32_t dst_stride = cw * 5 / 4;
@@ -216,22 +284,35 @@ static const uint8_t * cropSpecialRawFormatImage(const c_libcamera_image & image
   }
   else {
 
+    if ( cropSize == imageSize ) {
+      outhdr->width = cw;
+      outhdr->height = ch;
+      outhdr->stride = imageStride;
+      outhdr->datasize = dataSize;
+      outhdr->fourcc = imageFormat.fourcc();
+      outhdr->fourcc_modifier = imageFormat.modifier();
+      outhdr->bpp = 8;
+      return image.pane(0).data();
+    }
+
+    const uint32_t bpp = secialRawFormatBPP(imageFormat);
+    const uint32_t pixel_size = (bpp + 7) / 8;
     const uint32_t src_stride = imageStride;
-    const uint32_t dst_stride = cw * sizeof(uint16_t);
+    const uint32_t dst_stride = cw * pixel_size;
 
     specialCropBuffer.resize(ch * dst_stride);
 
-    const uint8_t * srcp = image.pane(0).data() + cx * sizeof(uint16_t);
+    const uint8_t * srcp = image.pane(0).data() + cx * pixel_size;
     uint8_t * dstp = specialCropBuffer.data();
 
     for( uint32_t y = 0; y < ch; ++y ) {
-      memcpy(dstp + y * dst_stride, srcp + (y + cy) * src_stride, cw * sizeof(uint16_t));
+      memcpy(dstp + y * dst_stride, srcp + (y + cy) * src_stride, cw * pixel_size);
     }
 
     outhdr->stride = dst_stride;
     outhdr->fourcc = imageFormat.fourcc();
     outhdr->fourcc_modifier = imageFormat.modifier();
-    outhdr->bpp = 16;
+    outhdr->bpp = bpp;
   }
 
   outhdr->width = cw;
@@ -239,6 +320,133 @@ static const uint8_t * cropSpecialRawFormatImage(const c_libcamera_image & image
   outhdr->datasize = specialCropBuffer.size();
 
   return specialCropBuffer.data();
+}
+
+template<class T>
+static const uint8_t* crop_demosaic_avgc(const c_libcamera_image & image,
+    const Size & imageSize,
+    uint32_t imageStride,
+    const Size & cropSize,
+    int bpp,
+    int ri, int g1i, int g2i, int bi, // indexes for (row, col)
+    ImageHeader * outhdr)
+{
+  static thread_local std::vector<T> outputBuffer;
+
+  const uint32_t cw = cropSize.width & ~0x1U;
+  const uint32_t ch = cropSize.height & ~0x1U;
+  const uint32_t cx = ((imageSize.width - cw) / 2) & ~0x1U;
+  const uint32_t cy = ((imageSize.height - ch) / 2) & ~0x1U;
+
+  const uint32_t dst_stride_pixels = cw / 2;
+
+  outputBuffer.resize((ch / 2) * 3 * dst_stride_pixels);
+
+#if IS_PI5  // Raspberry Pi 5 expands 10-bit sensor data by a left shift of 6
+  const int bs = bpp == 10 ? 6 : bpp == 12 ? 4 : bpp == 14 ? 2 : 0;
+#endif
+
+  const uint8_t * srcp = image.pane(0).data() + cy * imageStride + cx * sizeof(T);
+  T * __restrict dstp = outputBuffer.data();
+
+  run_loop(0U, ch / 2, [=](uint32_t y) {
+    const T * r1 = reinterpret_cast<const T*> (srcp + (y * 2 + 0) * imageStride);
+    const T * r2 = reinterpret_cast<const T*> (srcp + (y * 2 + 1) * imageStride);
+
+    T * __restrict dstRow = dstp + 3 * y * dst_stride_pixels;
+    for( int x = 0; x < cw / 2; ++x ) {
+#if IS_PI5  // Raspberry Pi 5 expands 10-bit sensor data by a left shift of 6
+      const T p[] = {r1[x * 2] >> bs, r1[x * 2 + 1] >> bs, r2[x * 2] >> bs, r2[x * 2 + 1] >> bs};
+#else
+      const T p[] = {r1[x * 2], r1[x * 2 + 1], r2[x * 2], r2[x * 2 + 1]};
+#endif
+      const T r = p[ri];
+      const T b = p[bi];
+      const T g = static_cast<T>((static_cast<uint32_t>(p[g1i]) + static_cast<uint32_t>(p[g2i])) / 2);
+      dstRow[x * 3 + 0] = b;
+      dstRow[x * 3 + 1] = g;
+      dstRow[x * 3 + 2] = r;
+    }});
+
+  static constexpr PixelFormat fmt = (sizeof(T) == 1) ? formats::BGR888 : formats::BGR161616;
+
+  outhdr->width = cw / 2;
+  outhdr->height = ch / 2;
+  outhdr->stride = 3 * dst_stride_pixels * sizeof(T);
+  outhdr->datasize = outputBuffer.size() * sizeof(T);
+  outhdr->fourcc = fmt.fourcc();
+  outhdr->fourcc_modifier = fmt.modifier();
+  outhdr->bpp = bpp;
+
+  return reinterpret_cast<const uint8_t*>(outputBuffer.data());
+}
+
+static const uint8_t * avcdSpecialRawFormatImage(const c_libcamera_image & image,
+    const PixelFormat & imageFormat,
+    const Size & imageSize,
+    uint32_t imageStride,
+    const Size & cropSize,
+    ImageHeader * outhdr)
+{
+  // Channel indexes inside of 2x2 binnig blocks
+  // p00 p01
+  // p10 p11
+  int ri, g1i, g2i, bi; // indexes for (row, col)
+
+  switch (imageFormat) {
+    //  R G1
+    //  G2 B
+    case formats::SRGGB8:
+    case formats::SRGGB10:
+    case formats::SRGGB12:
+    case formats::SRGGB14:
+    case formats::SRGGB16:
+      ri = 0; g1i = 1; g2i = 2; bi = 3;
+      break;
+
+    //  G1 R
+    //  B G2
+    case formats::SGRBG8:
+    case formats::SGRBG10:
+    case formats::SGRBG12:
+    case formats::SGRBG14:
+    case formats::SGRBG16:
+      g1i = 0; ri = 1; bi = 2; g2i = 3;
+      break;
+
+    // G1 B
+    // R G2
+    case formats::SGBRG8:
+    case formats::SGBRG10:
+    case formats::SGBRG12:
+    case formats::SGBRG14:
+    case formats::SGBRG16:
+      g1i = 0; bi = 1; ri = 2; g2i = 3;
+      break;
+
+    // B G1
+    // G2 R
+    case formats::SBGGR8:
+    case formats::SBGGR10:
+    case formats::SBGGR12:
+    case formats::SBGGR14:
+    case formats::SBGGR16:
+      bi = 0; g1i = 1; g2i = 2; ri = 3;
+      break;
+    default: // Not supported
+      CF_ERROR("Not supported imageFormat '%s'", imageFormat.toString().c_str());
+      return nullptr;
+  }
+
+  const int bpp = secialRawFormatBPP(imageFormat);
+  if ( bpp <= 8 ) {
+    return crop_demosaic_avgc<uint8_t>(image, imageSize, imageStride, cropSize, bpp, ri, g1i, g2i, bi,  outhdr);
+  }
+  if ( bpp <= 16 ) {
+    return crop_demosaic_avgc<uint16_t>(image, imageSize, imageStride, cropSize, bpp, ri, g1i, g2i, bi,  outhdr);
+  }
+
+  return nullptr;
 }
 
 static std::string ntoa(const struct sockaddr_in & sin)
@@ -508,11 +716,30 @@ static void camera_thread()
         const uint32_t stride = config.stride;
         const uint32_t datasize = config.frameSize;
 
-        const int specialRawFormatIndex =
-            specialRawSwCropSize.width > 0 && specialRawSwCropSize.height > 0 ?
-                isSecialRawFormat(pixelFormat) : -1;
+        const int isSpecialFormat = isSecialRawFormat(pixelFormat) >= 0;
+        const bool cropRequested = specialRawSwCropSize.width > 0 && specialRawSwCropSize.height > 0;
+        const bool avgcRequested = enableSecialRawFormatAvgcd;
 
-        if ( specialRawFormatIndex < 0 ) {
+        if ( isSpecialFormat && avgcRequested ) {
+          data =
+            avcdSpecialRawFormatImage(*currentImage,
+                pixelFormat,
+                size,
+                stride,
+                specialRawSwCropSize.isNull() ? size : specialRawSwCropSize,
+                &hdr);
+        }
+        else if ( isSpecialFormat && cropRequested && specialRawSwCropSize != size ) {
+          data =
+              cropSpecialRawFormatImage(*currentImage,
+                  pixelFormat,
+                  size,
+                  stride,
+                  datasize,
+                  specialRawSwCropSize,
+                  &hdr);
+        }
+        else {
           hdr.width = size.width;
           hdr.height = size.height;
           hdr.stride = stride;
@@ -521,15 +748,6 @@ static void camera_thread()
           hdr.fourcc = pixelFormat.fourcc();
           hdr.fourcc_modifier = pixelFormat.modifier();
           data = currentImage->pane(0).data();
-        }
-        else {
-          data =
-              cropSpecialRawFormatImage(*currentImage,
-                  pixelFormat,
-                  size,
-                  stride,
-                  specialRawSwCropSize,
-                  &hdr);
         }
 
         hdr.timestamp = timestamp;
@@ -580,7 +798,7 @@ static void camera_thread()
         }
 
         if ( fail ) {
-          CF_DEBUG("Break by so_sctp_sendmsg() fail");
+          CF_DEBUG("Break by so_sctp_sendmsg()");
           struct linger lo = { .l_onoff = 1, .l_linger = 0 };
           setsockopt(cameraThread.client_socket, SOL_SOCKET, SO_LINGER, &lo, sizeof(lo));
           shutdown(cameraThread.client_socket, SHUT_RDWR);
@@ -821,12 +1039,17 @@ static void start_camera(c_config_setting input, c_config_setting output)
   std::string pixelFormat;
   std::string captureSize;
   int specialRawFormatIndex = -1;
+  bool avgcd = false;
 
   load_settings(input, "name", &cameraName);
   load_settings(input, "streamRole", &streamRole);
   load_settings(input, "format", &pixelFormat);
   load_settings(input, "buffers", &bufferCount);
   load_settings(input, "size", &captureSize);
+  load_settings(input, "avgcd", &avgcd);
+
+  specialRawSwCropSize.width = 0;
+  specialRawSwCropSize.height = 0;
 
   if ( cameraName.empty() ) {
     set_status(output, "error", "No camera name specified");
@@ -882,10 +1105,19 @@ static void start_camera(c_config_setting input, c_config_setting output)
   }
 
   if( specialRawFormatIndex >= 0 ) {
-    specialRawSwCropSize = streamConfig.size;
-    streamConfig.size = currentCamera->properties().get(libcamera::properties::PixelArraySize).value();
-    CF_DEBUG("Requested SW Crop %dx%d -> %dx%d", streamConfig.size.width, streamConfig.size.height, specialRawSwCropSize.width, specialRawSwCropSize.height);
+    const StreamConfiguration streamConfigBackup = streamConfig;
+    CameraConfiguration::Status status = cameraConfig->validate();
+
+    if (status == CameraConfiguration::Invalid || streamConfig.size != streamConfigBackup.size ) {
+      streamConfig = streamConfigBackup;
+      specialRawSwCropSize = streamConfig.size;
+      streamConfig.size = currentCamera->properties().get(libcamera::properties::PixelArraySize).value();
+      CF_DEBUG("Requested SW Crop %dx%d -> %dx%d status=%d", streamConfig.size.width, streamConfig.size.height, specialRawSwCropSize.width, specialRawSwCropSize.height, status);
+    }
   }
+
+  enableSecialRawFormatAvgcd = avgcd;
+  CF_DEBUG("enableSecialRawFormatAvgcd=%d", enableSecialRawFormatAvgcd);
 
   const CameraConfiguration::Status validateStatus = cameraConfig->validate();
   switch ( validateStatus ) {
@@ -1097,36 +1329,6 @@ int main(int argc, char *argv[])
     CF_ERROR("so_listen('%s') fails. errno=%d %s", bind_address.c_str(), errno, strerror(errno));
     return 1;
   }
-
-//  if ( true ) {
-//    struct sctp_sack_info sack_info = {0};
-//    socklen_t len = sizeof(sack_info);
-//    if ( getsockopt(so, IPPROTO_SCTP, SCTP_DELAYED_SACK, &sack_info, &len) < 0 ) {
-//      CF_DEBUG("getsockopt(SCTP_DELAYED_SACK) fails. errno=%d (%s)", errno, strerror(errno) );
-//    }
-//    CF_DEBUG("1: SCTP_DELAYED_SACK: Delay: %u, Freq: %u", sack_info.sack_delay, sack_info.sack_freq);
-//  }
-
-//  if ( true ) {
-//    // Set to disable (freq=1, delay=0)
-//    struct sctp_sack_info sack_info = {0};
-//    socklen_t len = sizeof(sack_info);
-//    sack_info.sack_delay = 0;
-//    sack_info.sack_freq = 1; // Sets frequency to 1 for immediate ACKs
-//    sack_info.sack_assoc_id = SCTP_ALL_ASSOC; // Or specific assoc ID
-//    if ( setsockopt(so, IPPROTO_SCTP, SCTP_DELAYED_SACK, &sack_info, len) < 0 ) {
-//      CF_DEBUG("setsockopt(SCTP_DELAYED_SACK) fails. errno=%d (%s)", errno, strerror(errno) );
-//    }
-//  }
-
-//  if ( true ) {
-//    struct sctp_sack_info sack_info = {0};
-//    socklen_t len = sizeof(sack_info);
-//    if ( getsockopt(so, IPPROTO_SCTP, SCTP_DELAYED_SACK, &sack_info, &len) < 0 ) {
-//      CF_DEBUG("getsockopt(SCTP_DELAYED_SACK) fails. errno=%d (%s)", errno, strerror(errno) );
-//    }
-//    CF_DEBUG("2: SCTP_DELAYED_SACK: Delay: %u, Freq: %u", sack_info.sack_delay, sack_info.sack_freq);
-//  }
 
   while (42) {
     struct sockaddr_in caddrs = {0};

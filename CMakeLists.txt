@@ -102,6 +102,32 @@ else()
 endif()
 
 # ----------------------------------------------------------------------------
+# OpenCV
+#
+#find_package(OpenCV QUIET)
+#if(OpenCV_FOUND)
+#    message(STATUS "OpenCV found! Version: ${OpenCV_VERSION}")
+#    add_definitions(-DHAVE_OPENCV=1)
+#else()
+#    message(WARNING "OpenCV NOT found. Some features will be disabled.")
+#endif()
+
+# ----------------------------------------------------------------------------
+# TBB
+#
+set(TBB_INCLUDES "")
+set(TBB_LIBS "")
+find_package(TBB QUIET)
+if(TBB_FOUND)
+    message(STATUS "TBB found: version ${TBB_VERSION} ${TBB_INCLUDE_DIRS}")
+	set(TBB_INCLUDES ${TBB_INCLUDE_DIRS})
+	set(TBB_LIBS TBB::tbb)
+    add_definitions(-DHAVE_TBB=1)
+else()
+    message(WARNING "TBB not found. Building without TBB support.")
+endif()
+
+# ----------------------------------------------------------------------------
 # RPI version
 #
 # 1. Read the system model file directly into a variable
@@ -138,8 +164,8 @@ add_executable(${PROJECT_NAME}
 	${HEADER_FILES}
 	${RESOURCE_FILES})
 
-include_directories(${SRC} ${LIBCAMERA_INCLUDE_DIRS} ${LIBCONFIG_INCLUDE_DIRS} ${SCTP_INCLUDE_DIRS} ${CORE_INCLUDES})
-target_link_libraries(${PROJECT_NAME} ${CORE_LIBRARIES} ${LIBCAMERA_LINK_LIBRARIES} ${LIBCONFIG_LIBRARIES} ${SCTP_LIBRARIES})
+include_directories(${SRC} ${LIBCAMERA_INCLUDE_DIRS} ${LIBCONFIG_INCLUDE_DIRS} ${SCTP_INCLUDE_DIRS} ${TBB_INCLUDES})
+target_link_libraries(${PROJECT_NAME} ${LIBCAMERA_LINK_LIBRARIES} ${LIBCONFIG_LIBRARIES} ${SCTP_LIBRARIES} ${TBB_LIBS})
 
 
 ## Install app as a service
